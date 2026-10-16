@@ -1,0 +1,25 @@
+
+{
+  "owner": "esbuild",
+  "fileLocation": ["relative", "${workspaceFolder}"],
+  "pattern": [
+    {
+      "regexp": "^✘ \\[(ERROR|WARNING)\\] (.*)$",
+      "severity": 1,
+      "message": 2
+    },
+    {
+      "regexp": "^\\s*(.*):(\\d+):(\\d+): (ERROR|WARNING): (.*)$",
+      "file": 1,
+      "line": 2,
+      "column": 3,
+      "severity": 4,
+      "message": 5
+    }
+  ],
+  "background": {
+    "activeOnStart": true,
+    "beginsPattern": ".*",
+    "endsPattern": "Done in .*"
+  }
+}
