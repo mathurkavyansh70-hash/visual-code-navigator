@@ -170,7 +170,34 @@ export function activate(context: vscode.ExtensionContext) {
 						outputChannel.appendLine(
 							`Showing Quick Pick with ${choices.length - 1} CSS source option(s).`
 						);
+						// Find the JavaScript source associated with the selected element.
+						const elementId =
+							typeof message.id === 'string' ? message.id : '';
 
+						if (elementId) {
+							const jsResult = await findJavaScriptSource(
+								projectFolder,
+								elementId
+							);
+
+							if (jsResult) {
+								const relativePath = path.relative(
+									projectFolder.fsPath,
+									jsResult.uri.fsPath
+								);
+
+								outputChannel.appendLine(
+									`Resolved JavaScript source to ${relativePath}:${jsResult.line}.`
+								);
+
+								choices.push({
+									label: `$(symbol-event) JS: ${elementId}`,
+									description: `${relativePath}:${jsResult.line} — ${jsResult.description}`,
+									uri: jsResult.uri,
+									line: jsResult.line
+								});
+							}
+						}
 						// Let the user choose HTML or a matching CSS rule.
 						const selected = await vscode.window.showQuickPick(
 							choices,
@@ -454,6 +481,18 @@ export function buildPreviewHtml(
                 return;
             }
 
+			// Ctrl + click: allow normal website interaction.
+			if (event.ctrlKey) {
+				return;
+			}
+
+			// Normal clicks are for inspection, not website interaction.
+			event.preventDefault();
+			event.stopImmediatePropagation();
+
+			// Normal clicks are for inspection, not website interaction.
+			event.preventDefault();
+			event.stopImmediatePropagation();
             // Find the closest element connected to an HTML source line.
             const sourceElement = target.closest(
                 '[data-vcn-source-line]'
@@ -487,37 +526,83 @@ export function buildPreviewHtml(
 				cssCandidates: findMatchingCssRules(target)
             };
 
-            inspector.replaceChildren();
+			
+			const inspectorWasHidden =
+				inspector.dataset.hidden === 'true';
 
-            const title = document.createElement('strong');
-            title.textContent = 'SELECTED ELEMENT';
+            
+			inspector.replaceChildren();
 
-            const info = document.createElement('div');
-            info.textContent = '<' + details.tag + '> ' +
-                (details.id ? '#' + details.id : '');
+			const title = document.createElement('strong');
+			title.textContent = 'SELECTED ELEMENT';
 
-            const classInfo = document.createElement('div');
-            classInfo.textContent = 'Classes: ' +
-                (details.classes || 'None');
+			const hideButton = document.createElement('button');
+			hideButton.textContent = 'Hide';
+			hideButton.type = 'button';
+			hideButton.style.cssText =
+				'float:right; cursor:pointer; margin-left:12px;';
 
-            const textInfo = document.createElement('div');
-            textInfo.textContent = 'Text: ' +
-                (details.text || 'None');
+			hideButton.addEventListener('click', () => {
+				inspector.dataset.hidden = 'true';
+				inspector.style.display = 'none';
 
-            const lineInfo = document.createElement('div');
-            lineInfo.textContent = 'HTML line: ' +
-                details.sourceLine;
+				showInspectorButton.style.display = 'block';
+			});
 
-            inspector.append(
-                title,
-                info,
-                classInfo,
-                textInfo,
-                lineInfo
-            );
+			const info = document.createElement('div');
+			info.textContent = '<' + details.tag + '> ' +
+				(details.id ? '#' + details.id : '');
+
+			const classInfo = document.createElement('div');
+			classInfo.textContent = 'Classes: ' +
+				(details.classes || 'None');
+
+			const textInfo = document.createElement('div');
+			textInfo.textContent = 'Text: ' +
+				(details.text || 'None');
+
+			const lineInfo = document.createElement('div');
+			lineInfo.textContent = 'HTML line: ' +
+				details.sourceLine;
+
+			inspector.append(
+				title,
+				hideButton,
+				info,
+				classInfo,
+				textInfo,
+				lineInfo
+			);
+
+			if (inspectorWasHidden) {
+				inspector.style.display = 'none';
+				showInspectorButton.style.display = 'block';
+			}
+
 
             vscode.postMessage(details);
         }, true);
+		const showInspectorButton = document.createElement('button');
+
+		showInspectorButton.textContent = 'Show Inspector';
+		showInspectorButton.type = 'button';
+		showInspectorButton.style.cssText =
+			'position: fixed;' +
+			'bottom: 12px;' +
+			'right: 12px;' +
+			'z-index: 2147483647;' +
+			'display: none;' +
+			'padding: 8px 12px;' +
+			'cursor: pointer;';
+
+		showInspectorButton.addEventListener('click', () => {
+			inspector.dataset.hidden = 'false';
+			inspector.style.display = 'block';
+			showInspectorButton.style.display = 'none';
+		});
+
+		document.body.appendChild(showInspectorButton);
+
     `;
 
 	const additions = `
@@ -709,7 +794,140 @@ export async function findCssSource(
 	}
 }
 
+interface JavaScriptSource {
+	uri: vscode.Uri;
+	line: number;
+	description: string;
+}
 
+export async function findJavaScriptSource(
+	projectFolder: vscode.Uri,
+	elementId: string
+): Promise<JavaScriptSource | undefined> {
+	if (!elementId) {
+		return undefined;
+	}
+
+	const ignoredDirectories = new Set([
+		'node_modules',
+		'.git',
+		'dist',
+		'build',
+		'coverage'
+	]);
+
+	async function collectJavaScriptFiles(
+		directory: string
+	): Promise<string[]> {
+		const files: string[] = [];
+
+		let entries;
+
+		try {
+			entries = await fs.readdir(directory, {
+				withFileTypes: true
+			});
+		} catch {
+			return files;
+		}
+
+		for (const entry of entries) {
+			const fullPath = path.join(directory, entry.name);
+
+			if (entry.isDirectory()) {
+				if (ignoredDirectories.has(entry.name)) {
+					continue;
+				}
+
+				files.push(
+					...await collectJavaScriptFiles(fullPath)
+				);
+			} else if (
+				entry.isFile() &&
+				entry.name.endsWith('.js')
+			) {
+				files.push(fullPath);
+			}
+		}
+
+		return files;
+	}
+
+	const root = path.resolve(projectFolder.fsPath);
+	const files = await collectJavaScriptFiles(root);
+
+	const escapedId = elementId.replace(
+		/[.*+?^${}()|[\]\\]/g,
+		'\\$&'
+	);
+
+	const lookupPattern = new RegExp(
+		String.raw`getElementById\s*\(\s*(['"])${escapedId}\1\s*\)`
+	);
+
+	for (const filePath of files) {
+		const relativePath = path.relative(root, filePath);
+
+		if (
+			relativePath.startsWith('..') ||
+			path.isAbsolute(relativePath)
+		) {
+			continue;
+		}
+
+		let source: string;
+
+		try {
+			source = await fs.readFile(filePath, 'utf8');
+		} catch {
+			continue;
+		}
+
+		const lines = source.split(/\r?\n/);
+		const lookupLine = lines.findIndex(
+			line => lookupPattern.test(line)
+		);
+
+		if (lookupLine === -1) {
+			continue;
+		}
+
+		const variableMatch = lines[lookupLine].match(
+			/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/
+		);
+
+		if (!variableMatch) {
+			continue;
+		}
+
+		const variableName = variableMatch[1];
+		const escapedVariable = variableName.replace(
+			/[.*+?^${}()|[\]\\]/g,
+			'\\$&'
+		);
+
+		const listenerPattern = new RegExp(
+			String.raw`\b${escapedVariable}\s*\.\s*addEventListener\s*\(`
+		);
+
+		const listenerLine = lines.findIndex(
+			(line, index) =>
+				index > lookupLine && listenerPattern.test(line)
+		);
+
+		if (listenerLine === -1) {
+			continue;
+		}
+
+		return {
+			uri: vscode.Uri.file(filePath),
+			line: listenerLine + 1,
+			description: 'Click event listener'
+		};
+	}
+
+	return undefined;
+}
 function escapeAttribute(value: string): string {
 	return value
 		.replace(/&/g, '&amp;')
