@@ -36,18 +36,60 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 
 			const projectFolder = folders[0];
-			const indexFile = vscode.Uri.joinPath(
-				projectFolder,
-				'index.html'
+
+			const detectedProject = await detectProject(projectFolder);
+
+			outputChannel.appendLine(
+				`Detected project type: ${detectedProject.kind}`
 			);
 
-			try {
-				await fs.access(indexFile.fsPath);
-			} catch {
-				vscode.window.showErrorMessage(
-					'No index.html found in the selected folder.'
+			outputChannel.appendLine(
+				`HTML files found: ${detectedProject.htmlFiles.length}`
+			);
+
+			if (
+				detectedProject.kind === 'react-vite' ||
+				detectedProject.kind === 'react'
+			) {
+				vscode.window.showInformationMessage(
+					`React project detected (${detectedProject.kind}). ` +
+					'React preview support is the next implementation step.'
 				);
 				return;
+			}
+
+			if (detectedProject.htmlFiles.length === 0) {
+				vscode.window.showErrorMessage(
+					'No HTML entry file found. React/Vite projects are detected ' +
+					'separately; other framework support will be added later.'
+				);
+				return;
+			}
+
+			let indexFile: vscode.Uri;
+
+			if (detectedProject.htmlFiles.length === 1) {
+				indexFile = detectedProject.htmlFiles[0];
+			} else {
+				const selectedHtml = await vscode.window.showQuickPick(
+					detectedProject.htmlFiles.map(file => ({
+						label: path.relative(
+							projectFolder.fsPath,
+							file.fsPath
+						).replace(/\\/g, '/'),
+						description: 'HTML entry file',
+						uri: file
+					})),
+					{
+						placeHolder: 'Choose the HTML page to preview'
+					}
+				);
+
+				if (!selectedHtml) {
+					return;
+				}
+
+				indexFile = selectedHtml.uri;
 			}
 
 			const panel = vscode.window.createWebviewPanel(
@@ -60,8 +102,14 @@ export function activate(context: vscode.ExtensionContext) {
 				}
 			);
 
-			const baseUri = panel.webview.asWebviewUri(
+			const projectBaseUri = panel.webview.asWebviewUri(
 				vscode.Uri.file(projectFolder.fsPath + path.sep)
+			);
+
+			const htmlFolder = path.dirname(indexFile.fsPath);
+
+			const baseUri = panel.webview.asWebviewUri(
+				vscode.Uri.file(htmlFolder + path.sep)
 			);
 
 			const originalHtml = await fs.readFile(
@@ -120,7 +168,9 @@ export function activate(context: vscode.ExtensionContext) {
 						}[] = [
 								{
 									label: '$(code) Open HTML source',
-									description: `index.html:${sourceLine}`,
+									description: `${path.relative(projectFolder.fsPath, indexFile.fsPath)
+											.replace(/\\/g, '/')
+										}:${sourceLine}`,
 									uri: indexFile,
 									line: sourceLine
 								}
@@ -143,7 +193,7 @@ export function activate(context: vscode.ExtensionContext) {
 							);
 							const result = await findCssSource(
 								projectFolder,
-								baseUri.toString(),
+								projectBaseUri.toString(),
 								candidate.href,
 								candidate.selector,
 								messageText =>
@@ -651,6 +701,118 @@ export function buildPreviewHtml(
 	return html;
 }
 
+type ProjectKind = 'static-html' | 'react-vite' | 'react' | 'unknown';
+interface DetectedProject {
+	kind: ProjectKind;
+	htmlFiles: vscode.Uri[];
+	hasPackageJson: boolean;
+}
+async function detectProject(
+	projectFolder: vscode.Uri
+): Promise<DetectedProject> {
+	const ignoredDirectories = new Set([
+		'node_modules',
+		'.git',
+		'dist',
+		'build',
+		'coverage',
+		'.next',
+		'.vite',
+		'out'
+	]);
+	const htmlFiles: vscode.Uri[] = [];
+	async function scanDirectory(directory: string): Promise<void> {
+		let entries;
+		try {
+			entries = await fs.readdir(directory, {
+				withFileTypes: true
+			});
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			const fullPath = path.join(directory, entry.name);
+			if (entry.isDirectory()) {
+				if (!ignoredDirectories.has(entry.name)) {
+					await scanDirectory(fullPath);
+				}
+				continue;
+			}
+			if (
+				entry.isFile() &&
+				/\.html?$/i.test(entry.name)
+			) {
+				htmlFiles.push(vscode.Uri.file(fullPath));
+			}
+		}
+	}
+	await scanDirectory(projectFolder.fsPath);
+	// Prefer the conventional root index.html, then nested index files.
+	htmlFiles.sort((a, b) => {
+		const aRelative = path.relative(
+			projectFolder.fsPath,
+			a.fsPath
+		).replace(/\\/g, '/');
+
+		const bRelative = path.relative(
+			projectFolder.fsPath,
+			b.fsPath
+		).replace(/\\/g, '/');
+
+		const score = (relativePath: string) => {
+			if (relativePath === 'index.html') return 0;
+			if (path.posix.basename(relativePath) === 'index.html') {
+				return 1;
+			}
+			return 2;
+		};
+
+		return score(aRelative) - score(bRelative) ||
+			aRelative.localeCompare(bRelative);
+	});
+
+	let hasPackageJson = false;
+	let kind: ProjectKind = htmlFiles.length > 0
+		? 'static-html'
+		: 'unknown';
+
+	const packageJsonPath = path.join(
+		projectFolder.fsPath,
+		'package.json'
+	);
+
+	try {
+		const packageText = await fs.readFile(
+			packageJsonPath,
+			'utf8'
+		);
+
+		const packageData = JSON.parse(packageText);
+		hasPackageJson = true;
+
+		const dependencies = {
+			...packageData.dependencies,
+			...packageData.devDependencies
+		};
+
+		const isReact = Boolean(dependencies.react);
+		const isVite = Boolean(dependencies.vite);
+
+		if (isReact && isVite) {
+			kind = 'react-vite';
+		} else if (isReact) {
+			kind = 'react';
+		}
+	} catch {
+		// No package.json, or it isn't valid JSON.
+	}
+
+	return {
+		kind,
+		htmlFiles,
+		hasPackageJson
+	};
+}
 function addSourceMarkers(html: string): string {
 	// Skip comments and entire script/style blocks so that tag-like
 	// strings inside them are not mistaken for HTML elements.
