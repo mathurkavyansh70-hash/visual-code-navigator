@@ -151,7 +151,7 @@ async function createVcnViteConfig(
 		}
 	}
 
-	
+
 	const inspectorScript = `
 	(() => {
 		if (window.__vcnInspectorInstalled) return;
@@ -315,6 +315,15 @@ async function createVcnViteConfig(
 
 			selected = target;
 			selected.classList.add('vcn-react-selected');
+			const source = selected.getAttribute('data-vcn-source');
+			console.log('[VCN selected source]', source);
+
+			if (source) {
+				window.parent.postMessage({
+					type: 'vcnOpenSource',
+					source
+				},'*');
+			}
 
 			originalInlineStyles = {};
 
@@ -341,22 +350,133 @@ async function createVcnViteConfig(
 
 	const configSource = `
         import { mergeConfig } from 'vite';
-        ${originalImport}
-
+		import { parse } from '@babel/parser';
+		${originalImport}
+	
         const inspectorScript = ${JSON.stringify(inspectorScript)};
+		
+		const inspectorPlugin = {
+		name: 'visual-code-navigator-inspector',
+		apply: 'serve',
+		enforce: 'pre',
 
-        const inspectorPlugin = {
-            name: 'visual-code-navigator-inspector',
-            apply: 'serve',
+		
+		transform(code, id) {
+		const cleanId = id.split('?')[0];
 
-            transformIndexHtml() {
-                return [{
-                    tag: 'script',
-                    children: inspectorScript,
-                    injectTo: 'body'
-                }];
-            }
-        };
+		if (
+			!/\.[jt]sx$/.test(cleanId) ||
+			cleanId.includes('node_modules')
+		) {
+			return null;
+		}
+
+		try {
+		
+			
+		console.log('[VCN INPUT CHECK]', cleanId, 'first 12 lines:', code.split(String.fromCharCode(10)).slice(0, 12).map(function(line, i) { return String(i + 1) + ': ' + line; }).join(String.fromCharCode(10)));
+
+
+			const ast = parse(code, {
+			sourceType: 'module',
+			plugins: ['jsx', 'typescript', 'decorators-legacy']
+			});
+
+			const edits = [];
+
+			function visit(node) {
+			if (!node || typeof node !== 'object') return;
+
+			if (node.type === 'JSXOpeningElement') {
+				const hasMarker = node.attributes?.some(
+				(attribute) =>
+					attribute.type === 'JSXAttribute' &&
+					attribute.name?.type === 'JSXIdentifier' &&
+					attribute.name.name === 'data-vcn-source'
+				);
+
+				if (!hasMarker && Number.isInteger(node.start) &&
+					Number.isInteger(node.end) && node.loc?.start.line) {
+				const value = JSON.stringify(
+					cleanId + ':' + node.loc.start.line
+				);
+
+				// Insert before ">" or before "/" in a self-closing tag.
+				const insertAt = node.selfClosing
+					? node.end - 2
+					: node.end - 1;
+
+				
+				const marker = node.selfClosing
+				? ' data-vcn-source={' + value + '} '
+				: ' data-vcn-source={' + value + '}';
+
+
+				edits.push({ insertAt, marker });
+				}
+			}
+
+			for (const [key, value] of Object.entries(node)) {
+				if (key === 'loc' || key === 'start' || key === 'end' ||
+					key === 'extra' || key === 'comments' || key === 'tokens') {
+				continue;
+				}
+
+				if (Array.isArray(value)) {
+				for (const child of value) visit(child);
+				} else if (value && typeof value === 'object') {
+				visit(value);
+				}
+			}
+			}
+
+			visit(ast);
+
+			// Apply edits from right to left so earlier offsets stay valid.
+			edits.sort((a, b) => b.insertAt - a.insertAt);
+
+			let transformed = code;
+
+			for (const edit of edits) {
+			transformed =
+				transformed.slice(0, edit.insertAt) +
+				edit.marker +
+				transformed.slice(edit.insertAt);
+			}
+
+			console.log(
+			'[VCN markers injected]',
+			cleanId,
+			'count:',
+			edits.length
+			);
+
+			// No generator and no rewritten source map.
+			return {
+			code: transformed,
+			map: null
+			};
+		} catch (error) {
+			console.error(
+			'[VCN transform failed]',
+			cleanId,
+			error.message
+			);
+
+			return null;
+		}
+		},
+
+
+		transformIndexHtml() {
+			return [{
+			tag: 'script',
+			children: inspectorScript,
+			injectTo: 'body'
+			}];
+		}
+		};
+
 
         export default async (env) => {
             const original = ${originalConfigPath
@@ -366,9 +486,23 @@ async function createVcnViteConfig(
 			: '{}'
 		};
 
-            return mergeConfig(original || {}, {
-                plugins: [inspectorPlugin]
-            });
+            
+		const baseConfig = original || {};
+		const merged = mergeConfig(baseConfig, {});
+
+		const existingPlugins = Array.isArray(merged.plugins)
+		? merged.plugins
+		: merged.plugins
+			? [merged.plugins]
+			: [];
+
+		merged.plugins = [
+		inspectorPlugin,
+		...existingPlugins
+		];
+
+		return merged;
+
         };
     `;
 
@@ -636,6 +770,7 @@ async function startReactVitePreview(
                 http-equiv="Content-Security-Policy"
                 content="
                     default-src 'none';
+					script-src 'nonce-${nonce}';
                     frame-src ${url};
                     style-src 'unsafe-inline';
                 "
@@ -661,13 +796,99 @@ async function startReactVitePreview(
         </head>
         <body>
             <iframe
+				id="vcn-preview-frame"
                 src="${url}"
                 title="React application preview"
             ></iframe>
+		<script nonce="${nonce}">
+		const vscode = acquireVsCodeApi();
+		const frame = document.getElementById('vcn-preview-frame');
+
+		window.addEventListener('message', (event) => {
+
+			console.log('[VCN outer received]', event.data);
+			if (event.source !== frame.contentWindow) return;
+
+			const message = event.data;
+
+			if (
+				message?.type === 'vcnOpenSource' &&
+				typeof message.source === 'string'
+			) {
+				vscode.postMessage({
+					type: 'vcnOpenSource',
+					source: message.source
+				});
+			}
+		});
+	</script>
         </body>
         </html>
     `;
+	panel.webview.onDidReceiveMessage(async (message) => {
+		outputChannel.appendLine(
+			`[VCN extension received] type=${String(message?.type)} source=${String(message?.source)}`
+		);
+		if (
+			message?.type !== 'vcnOpenSource' ||
+			typeof message.source !== 'string'
+		) {
+			return;
+		}
 
+		const match = message.source.match(/^(.*):(\d+)$/);
+
+		if (!match) {
+			outputChannel.appendLine(
+				`[VCN invalid source format] ${message.source}`
+			);
+			return;
+		}
+
+		const filePath = path.resolve(match[1]);
+		const line = Number(match[2]);
+		outputChannel.appendLine(
+			`[VCN opening source] file=${filePath} line=${line}`
+		);
+		// Only allow files inside the selected project.
+		const relativePath = path.relative(projectPath, filePath);
+
+		if (
+			relativePath.startsWith('..') ||
+			path.isAbsolute(relativePath)
+		) {
+			vscode.window.showWarningMessage(
+				'Source file is outside the selected project.'
+			);
+			return;
+		}
+
+		try {
+			const document = await vscode.workspace.openTextDocument(
+				vscode.Uri.file(filePath)
+			);
+
+			const editor = await vscode.window.showTextDocument(
+				document,
+				vscode.ViewColumn.Beside
+			);
+
+			const position = new vscode.Position(
+				Math.max(0, Math.min(line - 1, document.lineCount - 1)),
+				0
+			);
+
+			editor.selection = new vscode.Selection(position, position);
+			editor.revealRange(
+				new vscode.Range(position, position),
+				vscode.TextEditorRevealType.InCenter
+			);
+		} catch (error) {
+			outputChannel.appendLine(
+				`Could not open source file: ${String(error)}`
+			);
+		}
+	});
 	panel.onDidDispose(() => {
 		stopPreviewServer(serverProcess);
 		outputChannel.appendLine(
@@ -1225,9 +1446,6 @@ export function buildPreviewHtml(
 			event.preventDefault();
 			event.stopImmediatePropagation();
 
-			// Normal clicks are for inspection, not website interaction.
-			event.preventDefault();
-			event.stopImmediatePropagation();
             // Find the closest element connected to an HTML source line.
             const sourceElement = target.closest(
                 '[data-vcn-source-line]'
