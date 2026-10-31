@@ -18,8 +18,12 @@
         "title": "Hello World"
       },
       {
-          "command": "visual-code-navigator.openProject",
-          "title": "Visual Code Navigator: Open Local Project"
+        "command": "visual-code-navigator.openProject",
+        "title": "Visual Code Navigator: Open Local Project"
+      },
+      {
+        "command": "visual-code-navigator.connectToServer",
+        "title": "Visual Code Navigator: Connect to Running Server"
       }
     ]
   },

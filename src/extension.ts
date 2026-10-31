@@ -513,6 +513,209 @@ async function createVcnViteConfig(
 	return configPath;
 }
 
+async function detectRunningServers(
+	outputChannel: vscode.OutputChannel
+): Promise<string[]> {
+	const ports = [
+		3000, 4173, 4200, 4321,
+		5173, 5174, 5175, 5176,
+		5177, 5178, 5179, 5180,
+		8080
+	];
+
+	const results = await Promise.all(
+		ports.map(async port => {
+			for (const host of ['127.0.0.1', '[::1]']) {
+				const url = `http://${host}:${port}`;
+
+				try {
+					const response = await fetch(url, {
+						signal: AbortSignal.timeout(3000)
+					});
+
+					outputChannel.appendLine(
+						`[VCN Detection] ${url} -> HTTP ${response.status}`
+					);
+
+					return response.status > 0
+						? `http://localhost:${port}`
+						: null;
+				} catch (error) {
+					const err = error as Error & {
+						cause?: Error & { code?: string };
+					};
+
+					outputChannel.appendLine(
+						`[VCN Detection] ${url} -> FAILED: ` +
+						`${err.cause?.code ?? err.message}`
+					);
+				}
+			}
+
+			return null;
+		})
+	);
+
+	return results.filter(
+		(url): url is string => url !== null
+	);
+}
+async function openPreviewPanel(
+	context: vscode.ExtensionContext,
+	projectPath: string,
+	url: string,
+	outputChannel: vscode.OutputChannel,
+	serverProcess?: ReturnType<typeof spawn>,
+	title = 'Visual Code Navigator Preview'
+): Promise<void> {
+	const panel = vscode.window.createWebviewPanel(
+		'visualCodeNavigatorPreview',
+		title,
+		vscode.ViewColumn.One,
+		{
+			enableScripts: true
+		}
+	);
+
+	const nonce = [...Array(32)]
+		.map(() => Math.random().toString(36).slice(2, 3))
+		.join('');
+
+	panel.webview.html = `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta
+                http-equiv="Content-Security-Policy"
+                content="
+                    default-src 'none';
+                    script-src 'nonce-${nonce}';
+                    frame-src ${url};
+                    style-src 'unsafe-inline';
+                "
+            >
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                html, body {
+                    margin: 0;
+                    padding: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: hidden;
+                }
+
+                iframe {
+                    display: block;
+                    width: 100%;
+                    height: 100%;
+                    border: 0;
+                }
+            </style>
+        </head>
+        <body>
+            <iframe
+                id="vcn-preview-frame"
+                src="${url}"
+                title="Website preview"
+            ></iframe>
+
+            <script nonce="${nonce}">
+                const vscode = acquireVsCodeApi();
+                const frame = document.getElementById('vcn-preview-frame');
+
+                window.addEventListener('message', (event) => {
+                    if (event.source !== frame.contentWindow) return;
+
+                    const message = event.data;
+
+                    if (
+                        message?.type === 'vcnOpenSource' &&
+                        typeof message.source === 'string'
+                    ) {
+                        vscode.postMessage({
+                            type: 'vcnOpenSource',
+                            source: message.source
+                        });
+                    }
+                });
+            </script>
+        </body>
+        </html>
+    `;
+
+	panel.webview.onDidReceiveMessage(async (message) => {
+		if (
+			message?.type !== 'vcnOpenSource' ||
+			typeof message.source !== 'string'
+		) {
+			return;
+		}
+
+		const match = message.source.match(/^(.*):(\d+)$/);
+
+		if (!match) { return; }
+
+		const filePath = path.resolve(match[1]);
+		const line = Number(match[2]);
+
+		const relativePath = path.relative(projectPath, filePath);
+
+		if (
+			relativePath.startsWith('..') ||
+			path.isAbsolute(relativePath)
+		) {
+			vscode.window.showWarningMessage(
+				'Source file is outside the selected project.'
+			);
+			return;
+		}
+
+		try {
+			const document = await vscode.workspace.openTextDocument(
+				vscode.Uri.file(filePath)
+			);
+
+			const editor = await vscode.window.showTextDocument(
+				document,
+				vscode.ViewColumn.Beside
+			);
+
+			const position = new vscode.Position(
+				Math.max(0, Math.min(line - 1, document.lineCount - 1)),
+				0
+			);
+
+			editor.selection = new vscode.Selection(position, position);
+
+			editor.revealRange(
+				new vscode.Range(position, position),
+				vscode.TextEditorRevealType.InCenter
+			);
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Could not open source file: ${String(error)}`
+			);
+		}
+	});
+
+	panel.onDidDispose(() => {
+		if (serverProcess) {
+			stopPreviewServer(serverProcess);
+		}
+	});
+
+	context.subscriptions.push({
+		dispose: () => {
+			if (serverProcess) {
+				stopPreviewServer(serverProcess);
+			}
+		}
+	});
+
+	outputChannel.appendLine(`Preview available at ${url}`);
+}
+
 async function startReactVitePreview(
 	context: vscode.ExtensionContext,
 	projectFolder: vscode.Uri,
@@ -698,7 +901,7 @@ async function startReactVitePreview(
 		return;
 	}
 
-	const url = `http://127.0.0.1:${port}`;
+	const url = `http://localhost:${port}`;
 
 	const isWindows = process.platform === 'win32';
 	const vcnConfigPath = await createVcnViteConfig(
@@ -748,159 +951,14 @@ async function startReactVitePreview(
 		return;
 	}
 
-	const panel = vscode.window.createWebviewPanel(
-		'visualCodeNavigatorReact',
-		'Visual Code Navigator — React Preview',
-		vscode.ViewColumn.One,
-		{
-			enableScripts: true
-		}
+	await openPreviewPanel(
+		context,
+		projectPath,
+		url,
+		outputChannel,
+		serverProcess,
+		'Visual Code Navigator — React Preview'
 	);
-
-	const nonce = [...Array(32)]
-		.map(() => Math.random().toString(36).slice(2, 3))
-		.join('');
-
-	panel.webview.html = `
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta
-                http-equiv="Content-Security-Policy"
-                content="
-                    default-src 'none';
-					script-src 'nonce-${nonce}';
-                    frame-src ${url};
-                    style-src 'unsafe-inline';
-                "
-            >
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>React Preview</title>
-            <style>
-                html, body {
-                    margin: 0;
-                    padding: 0;
-                    width: 100%;
-                    height: 100%;
-                    overflow: hidden;
-                }
-
-                iframe {
-                    display: block;
-                    width: 100%;
-                    height: 100%;
-                    border: 0;
-                }
-            </style>
-        </head>
-        <body>
-            <iframe
-				id="vcn-preview-frame"
-                src="${url}"
-                title="React application preview"
-            ></iframe>
-		<script nonce="${nonce}">
-		const vscode = acquireVsCodeApi();
-		const frame = document.getElementById('vcn-preview-frame');
-
-		window.addEventListener('message', (event) => {
-
-			console.log('[VCN outer received]', event.data);
-			if (event.source !== frame.contentWindow) return;
-
-			const message = event.data;
-
-			if (
-				message?.type === 'vcnOpenSource' &&
-				typeof message.source === 'string'
-			) {
-				vscode.postMessage({
-					type: 'vcnOpenSource',
-					source: message.source
-				});
-			}
-		});
-	</script>
-        </body>
-        </html>
-    `;
-	panel.webview.onDidReceiveMessage(async (message) => {
-		outputChannel.appendLine(
-			`[VCN extension received] type=${String(message?.type)} source=${String(message?.source)}`
-		);
-		if (
-			message?.type !== 'vcnOpenSource' ||
-			typeof message.source !== 'string'
-		) {
-			return;
-		}
-
-		const match = message.source.match(/^(.*):(\d+)$/);
-
-		if (!match) {
-			outputChannel.appendLine(
-				`[VCN invalid source format] ${message.source}`
-			);
-			return;
-		}
-
-		const filePath = path.resolve(match[1]);
-		const line = Number(match[2]);
-		outputChannel.appendLine(
-			`[VCN opening source] file=${filePath} line=${line}`
-		);
-		// Only allow files inside the selected project.
-		const relativePath = path.relative(projectPath, filePath);
-
-		if (
-			relativePath.startsWith('..') ||
-			path.isAbsolute(relativePath)
-		) {
-			vscode.window.showWarningMessage(
-				'Source file is outside the selected project.'
-			);
-			return;
-		}
-
-		try {
-			const document = await vscode.workspace.openTextDocument(
-				vscode.Uri.file(filePath)
-			);
-
-			const editor = await vscode.window.showTextDocument(
-				document,
-				vscode.ViewColumn.Beside
-			);
-
-			const position = new vscode.Position(
-				Math.max(0, Math.min(line - 1, document.lineCount - 1)),
-				0
-			);
-
-			editor.selection = new vscode.Selection(position, position);
-			editor.revealRange(
-				new vscode.Range(position, position),
-				vscode.TextEditorRevealType.InCenter
-			);
-		} catch (error) {
-			outputChannel.appendLine(
-				`Could not open source file: ${String(error)}`
-			);
-		}
-	});
-	panel.onDidDispose(() => {
-		stopPreviewServer(serverProcess);
-		outputChannel.appendLine(
-			`Stopped React preview server for ${projectPath}.`
-		);
-	});
-
-	context.subscriptions.push({
-		dispose: () => stopPreviewServer(serverProcess)
-	});
-
-	outputChannel.appendLine(`React preview available at ${url}`);
 }
 
 
@@ -1206,10 +1264,73 @@ export function activate(context: vscode.ExtensionContext) {
 
 		}
 	);
+	const connectToServerCommand = vscode.commands.registerCommand(
+		'visual-code-navigator.connectToServer',
+		async () => {
+			const servers = await detectRunningServers(outputChannel);
 
+			let selectedUrl: string | undefined;
+
+			if (servers.length === 1) {
+				selectedUrl = servers[0];
+			} else if (servers.length > 1) {
+				selectedUrl = await vscode.window.showQuickPick(
+					servers,
+					{
+						placeHolder: 'Choose a running local website'
+					}
+				);
+			} else {
+				selectedUrl = await vscode.window.showInputBox({
+					prompt: 'Enter your running website URL',
+					placeHolder: 'http://localhost:5173',
+					validateInput: value => {
+						try {
+							const parsed = new URL(value);
+
+							if (
+								parsed.protocol !== 'http:' &&
+								parsed.protocol !== 'https:'
+							) {
+								return 'Only HTTP and HTTPS URLs are supported.';
+							}
+
+							return undefined;
+						} catch {
+							return 'Enter a valid URL.';
+						}
+					}
+				});
+			}
+
+			if (!selectedUrl) {
+				return;
+			}
+
+			const projectFolder =
+				vscode.workspace.workspaceFolders?.[0];
+
+			if (!projectFolder) {
+				vscode.window.showErrorMessage(
+					'Open a project folder first.'
+				);
+				return;
+			}
+
+			await openPreviewPanel(
+				context,
+				projectFolder.uri.fsPath,
+				selectedUrl,
+				outputChannel,
+				undefined,
+				'Visual Code Navigator Preview'
+			);
+		}
+	);
 	context.subscriptions.push(
 		helloCommand,
-		openProjectCommand
+		openProjectCommand,
+		connectToServerCommand
 	);
 }
 
